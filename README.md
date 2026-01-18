@@ -41,6 +41,16 @@ python -m session_monitor
 
 On first run, the bot posts the panel message and stores its message id in `data/state.json`. Subsequent runs will re-use it.
 
+## NSSM log rotation
+
+If you run this bot under NSSM with stdout/stderr redirected to files, set rotation so the logs do not grow forever:
+
+```powershell
+.\nssm.exe set 16aa-server-session-monitor AppRotateBytes 5242880
+.\nssm.exe set 16aa-server-session-monitor AppRotateFiles 5
+.\nssm.exe set 16aa-server-session-monitor AppRotateOnline 1
+```
+
 ## Windows permissions
 
 - `quser` generally works for local users.

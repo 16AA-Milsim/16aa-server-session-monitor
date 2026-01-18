@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import socket
 import sys
 from dataclasses import dataclass
@@ -61,6 +62,50 @@ def _format_idle_minutes(minutes: int) -> str:
         return f"{hours}h {mins}m"
     days, hours = divmod(hours, 24)
     return f"{days}d {hours}h {mins}m"
+
+
+def _format_logon_time(raw: str) -> str:
+    if not raw:
+        return raw
+    match = re.search(r"(?i)(\d{1,2}):(\d{2})(?::\d{2})?\s*([ap]\.?m\.?)?", raw)
+    if not match:
+        return raw
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    meridiem = match.group(3)
+    if meridiem:
+        meridiem = meridiem.lower().replace(".", "")
+        if meridiem == "pm" and hour < 12:
+            hour += 12
+        elif meridiem == "am" and hour == 12:
+            hour = 0
+    formatted_time = f"{hour:02d}:{minute:02d}"
+    start, end = match.span()
+    return f"{raw[:start]}{formatted_time}{raw[end:]}"
+
+
+def _format_event_time_local(dt: datetime) -> str:
+    return dt.astimezone().strftime("%d/%m/%Y %H:%M")
+
+
+def _format_duration_minutes(minutes: int) -> str:
+    if minutes < 1:
+        return "0m"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m" if hours else f"{mins}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
+def _format_duration_since(dt: datetime, now: datetime) -> str:
+    delta = now - dt
+    if delta.total_seconds() < 0:
+        delta = timedelta(seconds=0)
+    minutes = int(delta.total_seconds() // 60)
+    if minutes < 1:
+        return "just now"
+    return f"{_format_duration_minutes(minutes)} ago"
 
 
 @dataclass(frozen=True)
@@ -234,24 +279,38 @@ class SessionMonitorClient(discord.Client):
             if row.idle.minutes is not None:
                 idle_display = _format_idle_minutes(row.idle.minutes)
 
-            engaged_text = "Yes" if row.engaged else "No"
-
-            lines = [
-                f"State: `{row.state}` | Engaged: `{engaged_text}`",
-                f"Idle: `{idle_display}`",
-            ]
-            if row.logon_time_raw:
-                lines.append(f"Logon: `{row.logon_time_raw}`")
-
-            if row.last_rdp_ip:
-                ip_line = f"Last RDP IP: `{row.last_rdp_ip}`"
-                if row.last_rdp_geo:
-                    ip_line += f" ({row.last_rdp_geo})"
+            lines = []
+            if row.state.lower() == "active":
+                engaged_text = "Yes" if row.engaged else "No"
+                lines.append(f"State: `{row.state}` | Engaged: `{engaged_text}` | Idle: `{idle_display}`")
+                minutes = None
                 if row.last_rdp_time_utc:
-                    ip_line += f" @ `{row.last_rdp_time_utc.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')}`"
-                lines.append(ip_line)
+                    minutes = int(max(0, (last_checked_utc - row.last_rdp_time_utc).total_seconds()) // 60)
+                duration = _format_duration_minutes(minutes or 0) if minutes is not None else None
+
+                if row.last_rdp_ip:
+                    ip_line = f"Connected: `{row.last_rdp_ip}`"
+                    if row.last_rdp_geo:
+                        ip_line += f" ({row.last_rdp_geo})"
+                    if duration:
+                        ip_line += f" | `{duration}`"
+                    lines.append(ip_line)
+                else:
+                    ip_line = "Connected: `(unknown)`"
+                    if duration:
+                        ip_line += f" | `{duration}`"
+                    lines.append(ip_line)
             else:
-                lines.append("Last RDP IP: `(unknown)`")
+                lines.append(f"State: `{row.state}`")
+                if row.last_rdp_time_utc:
+                    last_connected_display = _format_event_time_local(row.last_rdp_time_utc)
+                    duration = _format_duration_since(row.last_rdp_time_utc, last_checked_utc)
+                    lines.append(f"Last Connected: `{last_connected_display} ({duration})`")
+                elif row.logon_time_raw:
+                    last_connected_display = _format_logon_time(row.logon_time_raw)
+                    lines.append(f"Last Connected: `{last_connected_display}`")
+                else:
+                    lines.append("Last Connected: `-`")
 
             field_name = f"{self._status_dot(row)} {self._display_name(row.username)}"
             embed.add_field(name=field_name, value="\n".join(lines), inline=False)

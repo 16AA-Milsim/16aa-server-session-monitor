@@ -43,8 +43,9 @@ def get_latest_rdp_logons(
     max_events: int = 250,
 ) -> Dict[str, tuple[Optional[str], Optional[datetime]]]:
     """
-    Best-effort: returns username -> (ip, time_utc) for latest RDP logon (4624, LogonType=10).
+    Best-effort: returns username -> (ip, time_utc) for latest RDP logon.
     """
+    allowed_logon_types = {"10", "7"}
     wanted = {u.lower() for u in usernames}
     result: Dict[str, tuple[Optional[str], Optional[datetime]]] = {u: (None, None) for u in wanted}
 
@@ -53,7 +54,7 @@ def get_latest_rdp_logons(
             "wevtutil",
             "qe",
             "Security",
-            f"/q:*[System[(EventID=4624)]]",
+            "/q:*[System[(EventID=4624)]] and *[EventData[Data[@Name='LogonType']='10' or Data[@Name='LogonType']='7']]",
             "/f:xml",
             "/rd:true",
             f"/c:{int(max_events)}",
@@ -89,7 +90,7 @@ def get_latest_rdp_logons(
             continue
 
         logon_type = data.get("LogonType")
-        if logon_type != "10":
+        if logon_type not in allowed_logon_types:
             continue
 
         ip = data.get("IpAddress") or ""

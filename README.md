@@ -1,6 +1,6 @@
 # 16AA Server Session Monitor (Discord Bot)
 
-Discord bot that monitors active RDP sessions on a Windows Server using `quser`, enriches with the last RDP client IP from Security Event Log (4624 / LogonType 10), and updates a single “panel” message in Discord.
+Discord bot that monitors active RDP sessions on a Windows Server using `quser`, enriches with the last RDP client IP from Security Event Log (4624 / LogonType 10 or 7), and updates a single "panel" message in Discord.
 
 ## Features
 
@@ -9,7 +9,6 @@ Discord bot that monitors active RDP sessions on a Windows Server using `quser`,
 - Shows session state, idle time, logon time (from `quser`)
 - Shows last RDP client IP (from Security event log) and optional geo lookup
 - One combined panel message, edited in place (no channel spam)
-- Slash commands: `/status`, `/refresh`
 
 ## Setup
 
@@ -18,7 +17,6 @@ Discord bot that monitors active RDP sessions on a Windows Server using `quser`,
 - In Discord Developer Portal: create an application → add a bot → copy token
 - Invite bot to your server with scopes:
   - `bot`
-  - `applications.commands`
 - Bot permissions needed in the target channel:
   - View Channel, Send Messages, Embed Links, Read Message History
 

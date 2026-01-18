@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterable, Optional
 
 import discord
-from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
@@ -40,6 +39,30 @@ def _parse_users(raw: str) -> list[str]:
     return users
 
 
+def _parse_aliases(raw: str) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key and value:
+            aliases[key] = value
+    return aliases
+
+
+def _format_idle_minutes(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, mins = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {mins}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h {mins}m"
+
+
 @dataclass(frozen=True)
 class UserPanelRow:
     username: str
@@ -57,13 +80,10 @@ class UserPanelRow:
 class SessionMonitorClient(discord.Client):
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
-
-        self.guild_id = int(os.environ["GUILD_ID"])
         self.channel_id = int(os.environ["CHANNEL_ID"])
-        self.admin_role_id = int(os.environ["ADMIN_ROLE_ID"]) if os.getenv("ADMIN_ROLE_ID") else None
 
         self.monitor_users = _parse_users(os.getenv("MONITOR_USERS", "16aa,cantina,16aa_public,16aa_testing"))
+        self.user_aliases = _parse_aliases(os.getenv("USER_ALIASES", ""))
         self.idle_threshold_minutes = _env_int("IDLE_THRESHOLD_MINUTES", 10)
         self.poll_seconds = _env_int("POLL_SECONDS", 15)
         self.security_poll_seconds = _env_int("SECURITY_POLL_SECONDS", 60)
@@ -79,26 +99,36 @@ class SessionMonitorClient(discord.Client):
             u: (None, None) for u in self.monitor_users
         }
 
-    async def setup_hook(self) -> None:
-        guild = discord.Object(id=self.guild_id)
-        self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
+    def _display_name(self, username: str) -> str:
+        return self.user_aliases.get(username.lower(), username)
 
-    def _member_is_authorized(self, member: Optional[discord.Member]) -> bool:
-        if member is None:
-            return False
-        if self.admin_role_id is None:
-            return True
-        return any(role.id == self.admin_role_id for role in getattr(member, "roles", []))
+    def _status_dot(self, row: UserPanelRow) -> str:
+        if row.state.lower() == "active":
+            return ":red_circle:" if row.engaged else ":yellow_circle:"
+        return ":green_circle:"
 
     async def on_ready(self) -> None:
         self._panel_message_id = self.state_store.get_panel_message_id()
         self.update_panel.start()
         print(f"Logged in as {self.user} (panel_message_id={self._panel_message_id})")
 
+    async def close(self) -> None:
+        await self._delete_panel_message()
+        await super().close()
+
     async def _get_or_create_panel_message(self) -> discord.Message:
         channel = self.get_channel(self.channel_id)
-        if channel is None or not isinstance(channel, discord.abc.Messageable):
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(self.channel_id)
+            except discord.NotFound as exc:
+                raise RuntimeError("Configured CHANNEL_ID does not exist or bot cannot see it.") from exc
+            except discord.Forbidden as exc:
+                raise RuntimeError("Bot lacks permissions to access the configured CHANNEL_ID.") from exc
+            except discord.HTTPException as exc:
+                raise RuntimeError("Failed to fetch configured CHANNEL_ID from Discord.") from exc
+
+        if not isinstance(channel, discord.abc.Messageable):
             raise RuntimeError("Configured CHANNEL_ID is not a messageable channel or bot cannot see it.")
 
         if self._panel_message_id is not None:
@@ -112,6 +142,38 @@ class SessionMonitorClient(discord.Client):
         self._panel_message_id = message.id
         self.state_store.set_panel_message_id(message.id)
         return message
+
+    async def _delete_panel_message(self) -> None:
+        if self._panel_message_id is None:
+            return
+
+        channel = self.get_channel(self.channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(self.channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return
+
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+
+        deleted = False
+        try:
+            message = await channel.fetch_message(self._panel_message_id)
+        except discord.NotFound:
+            deleted = True
+        except (discord.Forbidden, discord.HTTPException):
+            return
+        else:
+            try:
+                await message.delete()
+                deleted = True
+            except (discord.Forbidden, discord.HTTPException):
+                return
+
+        if deleted:
+            self._panel_message_id = None
+            self.state_store.set_panel_message_id(None)
 
     def _build_rows(
         self,
@@ -162,29 +224,21 @@ class SessionMonitorClient(discord.Client):
     def _build_embed(self, *, rows: list[UserPanelRow], last_checked_utc: datetime) -> discord.Embed:
         embed = discord.Embed(
             title=f"RDP Session Monitor ({self.hostname})",
-            color=discord.Color.blurple(),
+            color=discord.Color.from_rgb(70, 70, 70),
             timestamp=last_checked_utc,
         )
-        embed.set_footer(text=f"Idle threshold: {self.idle_threshold_minutes}m | Last checked")
+        embed.set_footer(text="Last checked")
 
         for row in rows:
             idle_display = row.idle.raw
             if row.idle.minutes is not None:
-                idle_display = f"{row.idle.minutes}m ({row.idle.raw})"
+                idle_display = _format_idle_minutes(row.idle.minutes)
 
             engaged_text = "Yes" if row.engaged else "No"
-
-            session_bits = []
-            if row.session_name:
-                session_bits.append(row.session_name)
-            if row.session_id:
-                session_bits.append(f"ID {row.session_id}")
-            session_display = " | ".join(session_bits) if session_bits else "(none)"
 
             lines = [
                 f"State: `{row.state}` | Engaged: `{engaged_text}`",
                 f"Idle: `{idle_display}`",
-                f"Session: `{session_display}`",
             ]
             if row.logon_time_raw:
                 lines.append(f"Logon: `{row.logon_time_raw}`")
@@ -199,7 +253,8 @@ class SessionMonitorClient(discord.Client):
             else:
                 lines.append("Last RDP IP: `(unknown)`")
 
-            embed.add_field(name=row.username, value="\n".join(lines), inline=False)
+            field_name = f"{self._status_dot(row)} {self._display_name(row.username)}"
+            embed.add_field(name=field_name, value="\n".join(lines), inline=False)
 
         return embed
 
@@ -246,32 +301,12 @@ class SessionMonitorClient(discord.Client):
 def main() -> None:
     load_dotenv()
 
-    missing = [k for k in ["DISCORD_TOKEN", "GUILD_ID", "CHANNEL_ID"] if not os.getenv(k)]
+    missing = [k for k in ["DISCORD_TOKEN", "CHANNEL_ID"] if not os.getenv(k)]
     if missing:
         print(f"Missing required env vars: {', '.join(missing)}", file=sys.stderr)
         sys.exit(2)
 
     intents = discord.Intents.none()
     client = SessionMonitorClient(intents=intents)
-
-    @client.tree.command(name="status", description="Show current session status (ephemeral).")
-    async def status_cmd(interaction: discord.Interaction) -> None:
-        if not client._member_is_authorized(interaction.user if isinstance(interaction.user, discord.Member) else None):
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
-        sessions = get_quser_sessions()
-        rdp = get_latest_rdp_logons(client.monitor_users, max_events=250)
-        rows = client._build_rows(sessions, rdp)
-        embed = client._build_embed(rows=rows, last_checked_utc=datetime.now(timezone.utc))
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @client.tree.command(name="refresh", description="Force refresh the panel now.")
-    async def refresh_cmd(interaction: discord.Interaction) -> None:
-        if not client._member_is_authorized(interaction.user if isinstance(interaction.user, discord.Member) else None):
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
-        await interaction.response.send_message("Refreshing…", ephemeral=True)
-        client._last_embed_json = None
-        await client.update_panel()
 
     client.run(os.environ["DISCORD_TOKEN"])

@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 from .geo import GeoCache
 from .state_store import StateStore
-from .wevtutil_security import get_latest_rdp_logons
+from .wevtutil_security import get_latest_rdp_disconnects, get_latest_rdp_logons
 from .windows_sessions import IdleInfo, SessionInfo, get_quser_sessions
 
 
@@ -119,6 +119,7 @@ class UserPanelRow:
     logon_time_raw: Optional[str]
     last_rdp_ip: Optional[str]
     last_rdp_time_utc: Optional[datetime]
+    last_rdp_disconnect_time_utc: Optional[datetime]
     last_rdp_geo: Optional[str]
 
 
@@ -141,6 +142,9 @@ class SessionMonitorClient(discord.Client):
         self._last_embed_json: Optional[str] = None
         self._last_security_poll_utc: Optional[datetime] = None
         self._last_rdp_logons: Dict[str, tuple[Optional[str], Optional[datetime]]] = {
+            u: (None, None) for u in self.monitor_users
+        }
+        self._last_rdp_disconnects: Dict[str, tuple[Optional[str], Optional[datetime]]] = {
             u: (None, None) for u in self.monitor_users
         }
 
@@ -224,6 +228,7 @@ class SessionMonitorClient(discord.Client):
         self,
         sessions: Dict[str, SessionInfo],
         rdp_ip_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]],
+        rdp_disconnect_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]],
     ) -> list[UserPanelRow]:
         rows: list[UserPanelRow] = []
         for username in self.monitor_users:
@@ -241,6 +246,7 @@ class SessionMonitorClient(discord.Client):
                         logon_time_raw=None,
                         last_rdp_ip=rdp_ip_by_user.get(username, (None, None))[0],
                         last_rdp_time_utc=rdp_ip_by_user.get(username, (None, None))[1],
+                        last_rdp_disconnect_time_utc=rdp_disconnect_by_user.get(username, (None, None))[1],
                         last_rdp_geo=None,
                     )
                 )
@@ -248,6 +254,7 @@ class SessionMonitorClient(discord.Client):
 
             engaged = info.state.lower() == "active" and info.idle.minutes is not None and info.idle.minutes <= self.idle_threshold_minutes
             last_ip, last_time = rdp_ip_by_user.get(username, (None, None))
+            _, last_disconnect_time = rdp_disconnect_by_user.get(username, (None, None))
             geo = self.geo_cache.get_geo_string(last_ip) if last_ip else None
 
             rows.append(
@@ -261,6 +268,7 @@ class SessionMonitorClient(discord.Client):
                     logon_time_raw=info.logon_time_raw,
                     last_rdp_ip=last_ip,
                     last_rdp_time_utc=last_time,
+                    last_rdp_disconnect_time_utc=last_disconnect_time,
                     last_rdp_geo=geo,
                 )
             )
@@ -279,10 +287,11 @@ class SessionMonitorClient(discord.Client):
             if row.idle.minutes is not None:
                 idle_display = _format_idle_minutes(row.idle.minutes)
 
+            state_display = "Disconnected" if row.state.lower() == "disc" else row.state
             lines = []
             if row.state.lower() == "active":
                 engaged_text = "Yes" if row.engaged else "No"
-                lines.append(f"State: `{row.state}` | Engaged: `{engaged_text}` | Idle: `{idle_display}`")
+                lines.append(f"State: `{state_display}` | Engaged: `{engaged_text}` | Idle: `{idle_display}`")
                 minutes = None
                 if row.last_rdp_time_utc:
                     minutes = int(max(0, (last_checked_utc - row.last_rdp_time_utc).total_seconds()) // 60)
@@ -301,8 +310,12 @@ class SessionMonitorClient(discord.Client):
                         ip_line += f" | `{duration}`"
                     lines.append(ip_line)
             else:
-                lines.append(f"State: `{row.state}`")
-                if row.last_rdp_time_utc:
+                lines.append(f"State: `{state_display}`")
+                if row.last_rdp_disconnect_time_utc:
+                    last_connected_display = _format_event_time_local(row.last_rdp_disconnect_time_utc)
+                    duration = _format_duration_since(row.last_rdp_disconnect_time_utc, last_checked_utc)
+                    lines.append(f"Last Connected: `{last_connected_display} ({duration})`")
+                elif row.last_rdp_time_utc:
                     last_connected_display = _format_event_time_local(row.last_rdp_time_utc)
                     duration = _format_duration_since(row.last_rdp_time_utc, last_checked_utc)
                     lines.append(f"Last Connected: `{last_connected_display} ({duration})`")
@@ -334,14 +347,18 @@ class SessionMonitorClient(discord.Client):
         sessions = get_quser_sessions()
 
         rdp_ip_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]] = {}
+        rdp_disconnect_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]] = {}
         if self._should_refresh_security():
             rdp_ip_by_user = get_latest_rdp_logons(self.monitor_users, max_events=250)
+            rdp_disconnect_by_user = get_latest_rdp_disconnects(self.monitor_users, max_events=250)
             self._last_security_poll_utc = now
             self._last_rdp_logons = rdp_ip_by_user
+            self._last_rdp_disconnects = rdp_disconnect_by_user
         else:
             rdp_ip_by_user = self._last_rdp_logons
+            rdp_disconnect_by_user = self._last_rdp_disconnects
 
-        rows = self._build_rows(sessions, rdp_ip_by_user)
+        rows = self._build_rows(sessions, rdp_ip_by_user, rdp_disconnect_by_user)
         embed = self._build_embed(rows=rows, last_checked_utc=now)
 
         message = await self._get_or_create_panel_message()

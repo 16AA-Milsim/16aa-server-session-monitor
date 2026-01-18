@@ -120,6 +120,8 @@ class UserPanelRow:
     last_rdp_ip: Optional[str]
     last_rdp_time_utc: Optional[datetime]
     last_rdp_disconnect_time_utc: Optional[datetime]
+    pending_disconnect_since: Optional[datetime]
+    pending_disconnect: bool
     last_rdp_geo: Optional[str]
 
 
@@ -147,6 +149,8 @@ class SessionMonitorClient(discord.Client):
         self._last_rdp_disconnects: Dict[str, tuple[Optional[str], Optional[datetime]]] = {
             u: (None, None) for u in self.monitor_users
         }
+        self._last_session_states: Dict[str, str] = {u: "" for u in self.monitor_users}
+        self._pending_disconnect_since: Dict[str, Optional[datetime]] = {u: None for u in self.monitor_users}
 
     def _display_name(self, username: str) -> str:
         return self.user_aliases.get(username.lower(), username)
@@ -155,6 +159,9 @@ class SessionMonitorClient(discord.Client):
         if row.state.lower() == "active":
             return ":red_circle:" if row.engaged else ":yellow_circle:"
         return ":green_circle:"
+
+    def _pending_disconnect_tolerance(self) -> timedelta:
+        return timedelta(seconds=max(self.poll_seconds, self.security_poll_seconds) * 2)
 
     async def on_ready(self) -> None:
         self._panel_message_id = self.state_store.get_panel_message_id()
@@ -235,6 +242,8 @@ class SessionMonitorClient(discord.Client):
             info = sessions.get(username)
             if info is None:
                 idle = IdleInfo(raw="(none)", minutes=None)
+                pending_since = self._pending_disconnect_since.get(username)
+                pending_disconnect = pending_since is not None
                 rows.append(
                     UserPanelRow(
                         username=username,
@@ -247,6 +256,8 @@ class SessionMonitorClient(discord.Client):
                         last_rdp_ip=rdp_ip_by_user.get(username, (None, None))[0],
                         last_rdp_time_utc=rdp_ip_by_user.get(username, (None, None))[1],
                         last_rdp_disconnect_time_utc=rdp_disconnect_by_user.get(username, (None, None))[1],
+                        pending_disconnect_since=pending_since,
+                        pending_disconnect=pending_disconnect,
                         last_rdp_geo=None,
                     )
                 )
@@ -256,6 +267,8 @@ class SessionMonitorClient(discord.Client):
             last_ip, last_time = rdp_ip_by_user.get(username, (None, None))
             _, last_disconnect_time = rdp_disconnect_by_user.get(username, (None, None))
             geo = self.geo_cache.get_geo_string(last_ip) if last_ip else None
+            pending_since = self._pending_disconnect_since.get(username)
+            pending_disconnect = pending_since is not None
 
             rows.append(
                 UserPanelRow(
@@ -269,6 +282,8 @@ class SessionMonitorClient(discord.Client):
                     last_rdp_ip=last_ip,
                     last_rdp_time_utc=last_time,
                     last_rdp_disconnect_time_utc=last_disconnect_time,
+                    pending_disconnect_since=pending_since,
+                    pending_disconnect=pending_disconnect,
                     last_rdp_geo=geo,
                 )
             )
@@ -311,7 +326,17 @@ class SessionMonitorClient(discord.Client):
                     lines.append(ip_line)
             else:
                 lines.append(f"State: `{state_display}`")
-                if row.last_rdp_disconnect_time_utc:
+                if row.pending_disconnect_since:
+                    tolerance = self._pending_disconnect_tolerance()
+                    if row.last_rdp_disconnect_time_utc is None or row.last_rdp_disconnect_time_utc < (row.pending_disconnect_since - tolerance):
+                        lines.append("Last Connected: `...`")
+                        field_name = f"{self._status_dot(row)} {self._display_name(row.username)}"
+                        embed.add_field(name=field_name, value="\n".join(lines), inline=False)
+                        continue
+
+                if row.pending_disconnect and row.last_rdp_disconnect_time_utc is None:
+                    lines.append("Last Connected: `...`")
+                elif row.last_rdp_disconnect_time_utc:
                     last_connected_display = _format_event_time_local(row.last_rdp_disconnect_time_utc)
                     duration = _format_duration_since(row.last_rdp_disconnect_time_utc, last_checked_utc)
                     lines.append(f"Last Connected: `{last_connected_display} ({duration})`")
@@ -346,6 +371,19 @@ class SessionMonitorClient(discord.Client):
         now = datetime.now(timezone.utc)
         sessions = get_quser_sessions()
 
+        current_states: Dict[str, str] = {}
+        for username in self.monitor_users:
+            info = sessions.get(username)
+            current_states[username] = info.state.lower() if info is not None else "missing"
+
+        for username, current_state in current_states.items():
+            prev_state = self._last_session_states.get(username, "")
+            if prev_state == "active" and current_state != "active":
+                self._pending_disconnect_since[username] = now
+            elif current_state == "active":
+                self._pending_disconnect_since[username] = None
+            self._last_session_states[username] = current_state
+
         rdp_ip_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]] = {}
         rdp_disconnect_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]] = {}
         if self._should_refresh_security():
@@ -354,6 +392,13 @@ class SessionMonitorClient(discord.Client):
             self._last_security_poll_utc = now
             self._last_rdp_logons = rdp_ip_by_user
             self._last_rdp_disconnects = rdp_disconnect_by_user
+            tolerance = self._pending_disconnect_tolerance()
+            for username, pending_since in self._pending_disconnect_since.items():
+                if pending_since is None:
+                    continue
+                disconnect_time = rdp_disconnect_by_user.get(username, (None, None))[1]
+                if disconnect_time and disconnect_time >= (pending_since - tolerance):
+                    self._pending_disconnect_since[username] = None
         else:
             rdp_ip_by_user = self._last_rdp_logons
             rdp_disconnect_by_user = self._last_rdp_disconnects

@@ -135,10 +135,15 @@ class SessionMonitorClient(discord.Client):
         self.idle_threshold_minutes = _env_int("IDLE_THRESHOLD_MINUTES", 10)
         self.poll_seconds = _env_int("POLL_SECONDS", 15)
         self.security_poll_seconds = _env_int("SECURITY_POLL_SECONDS", 60)
+        self.geo_ttl_hours = _env_int("GEOLOOKUP_TTL_HOURS", 24)
 
         self.hostname = socket.gethostname()
         self.state_store = StateStore("data/state.json")
-        self.geo_cache = GeoCache("data/geo_cache.json", enabled=_env_bool("GEOLOOKUP_ENABLED", True))
+        self.geo_cache = GeoCache(
+            "data/geo_cache.json",
+            enabled=_env_bool("GEOLOOKUP_ENABLED", True),
+            ttl_hours=self.geo_ttl_hours,
+        )
 
         self._panel_message_id: Optional[int] = None
         self._last_embed_json: Optional[str] = None
@@ -149,6 +154,10 @@ class SessionMonitorClient(discord.Client):
         self._last_rdp_disconnects: Dict[str, tuple[Optional[str], Optional[datetime]]] = {
             u: (None, None) for u in self.monitor_users
         }
+        self._last_geo_key_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]] = {
+            u: (None, None) for u in self.monitor_users
+        }
+        self._last_geo_by_user: Dict[str, Optional[str]] = {u: None for u in self.monitor_users}
         self._last_session_states: Dict[str, str] = {u: "" for u in self.monitor_users}
         self._pending_disconnect_since: Dict[str, Optional[datetime]] = {u: None for u in self.monitor_users}
 
@@ -162,6 +171,31 @@ class SessionMonitorClient(discord.Client):
 
     def _pending_disconnect_tolerance(self) -> timedelta:
         return timedelta(seconds=max(self.poll_seconds, self.security_poll_seconds) * 2)
+
+    def _update_geo_cache(
+        self,
+        *,
+        sessions: Dict[str, SessionInfo],
+        rdp_ip_by_user: Dict[str, tuple[Optional[str], Optional[datetime]]],
+    ) -> None:
+        for username in self.monitor_users:
+            info = sessions.get(username)
+            if info is None or info.state.lower() != "active":
+                self._last_geo_key_by_user[username] = (None, None)
+                self._last_geo_by_user[username] = None
+                continue
+
+            ip, rdp_time = rdp_ip_by_user.get(username, (None, None))
+            key = (ip, rdp_time)
+            if key == self._last_geo_key_by_user.get(username) and self._last_geo_by_user.get(username):
+                continue
+
+            self._last_geo_key_by_user[username] = key
+            if not ip:
+                self._last_geo_by_user[username] = None
+                continue
+
+            self._last_geo_by_user[username] = self.geo_cache.get_geo_string(ip)
 
     async def on_ready(self) -> None:
         self._panel_message_id = self.state_store.get_panel_message_id()
@@ -266,7 +300,7 @@ class SessionMonitorClient(discord.Client):
             engaged = info.state.lower() == "active" and info.idle.minutes is not None and info.idle.minutes <= self.idle_threshold_minutes
             last_ip, last_time = rdp_ip_by_user.get(username, (None, None))
             _, last_disconnect_time = rdp_disconnect_by_user.get(username, (None, None))
-            geo = self.geo_cache.get_geo_string(last_ip) if last_ip else None
+            geo = self._last_geo_by_user.get(username) if info.state.lower() == "active" else None
             pending_since = self._pending_disconnect_since.get(username)
             pending_disconnect = pending_since is not None
 
@@ -329,13 +363,13 @@ class SessionMonitorClient(discord.Client):
                 if row.pending_disconnect_since:
                     tolerance = self._pending_disconnect_tolerance()
                     if row.last_rdp_disconnect_time_utc is None or row.last_rdp_disconnect_time_utc < (row.pending_disconnect_since - tolerance):
-                        lines.append("Last Connected: `...`")
+                        lines.append("Last Connected: ...")
                         field_name = f"{self._status_dot(row)} {self._display_name(row.username)}"
                         embed.add_field(name=field_name, value="\n".join(lines), inline=False)
                         continue
 
                 if row.pending_disconnect and row.last_rdp_disconnect_time_utc is None:
-                    lines.append("Last Connected: `...`")
+                    lines.append("Last Connected: ...")
                 elif row.last_rdp_disconnect_time_utc:
                     last_connected_display = _format_event_time_local(row.last_rdp_disconnect_time_utc)
                     duration = _format_duration_since(row.last_rdp_disconnect_time_utc, last_checked_utc)
@@ -402,6 +436,8 @@ class SessionMonitorClient(discord.Client):
         else:
             rdp_ip_by_user = self._last_rdp_logons
             rdp_disconnect_by_user = self._last_rdp_disconnects
+
+        self._update_geo_cache(sessions=sessions, rdp_ip_by_user=rdp_ip_by_user)
 
         rows = self._build_rows(sessions, rdp_ip_by_user, rdp_disconnect_by_user)
         embed = self._build_embed(rows=rows, last_checked_utc=now)

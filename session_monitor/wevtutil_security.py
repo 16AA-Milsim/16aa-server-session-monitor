@@ -176,3 +176,67 @@ def get_latest_rdp_disconnects(
 
     return result
 
+
+def get_latest_rdp_connects(
+    usernames: Iterable[str],
+    *,
+    max_events: int = 250,
+) -> Dict[str, tuple[Optional[str], Optional[datetime]]]:
+    """
+    Best-effort: returns username -> (ip, time_utc) for latest RDP connect (LSM EventID 25).
+    """
+    wanted = {u.lower() for u in usernames}
+    result: Dict[str, tuple[Optional[str], Optional[datetime]]] = {u: (None, None) for u in wanted}
+
+    cp = subprocess.run(
+        [
+            "wevtutil",
+            "qe",
+            "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+            "/q:*[System[(EventID=25)]]",
+            "/f:xml",
+            "/rd:true",
+            f"/c:{int(max_events)}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    raw = (cp.stdout or "").strip()
+    if not raw:
+        return result
+
+    xml = f"<Events>{raw}</Events>"
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return result
+
+    ns = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
+
+    for event in root.findall("e:Event", ns):
+        system = event.find("e:System", ns)
+        if system is None:
+            continue
+
+        time_created = system.find("e:TimeCreated", ns)
+        event_time_utc = _parse_event_time_utc(time_created.attrib.get("SystemTime", "") if time_created is not None else "")
+
+        data = _event_user_data_map(event)
+        user = (data.get("User") or "").strip()
+        if "\\" in user:
+            user = user.split("\\", 1)[1]
+        user = user.lower()
+        if user not in wanted:
+            continue
+
+        address = data.get("Address") or ""
+        if address in {"-", "::1", "127.0.0.1"}:
+            address = ""
+
+        current_ip, current_time = result.get(user, (None, None))
+        if current_time is None or (event_time_utc is not None and event_time_utc > current_time):
+            result[user] = (address or None, event_time_utc)
+
+    return result
+

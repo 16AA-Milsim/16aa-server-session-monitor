@@ -373,18 +373,22 @@ class SessionMonitorClient(discord.Client):
                     minutes = int(max(0, (last_checked_utc - effective_rdp_time).total_seconds()) // 60)
                 duration = _format_duration_minutes(minutes or 0) if minutes is not None else None
 
-                if row.last_rdp_ip:
-                    ip_line = f"Connected: `{row.last_rdp_ip}`"
-                    if row.last_rdp_geo:
-                        ip_line += f" ({row.last_rdp_geo})"
-                    if duration:
-                        ip_line += f" | `{duration}`"
-                    lines.append(ip_line)
+                awaiting_details = row.pending_connection_since is not None and effective_rdp_time is None
+                if awaiting_details:
+                    lines.append("Connected: ...")
                 else:
-                    ip_line = "Connected: `(unknown)`"
-                    if duration:
-                        ip_line += f" | `{duration}`"
-                    lines.append(ip_line)
+                    if row.last_rdp_ip:
+                        ip_line = f"Connected: `{row.last_rdp_ip}`"
+                        if row.last_rdp_geo:
+                            ip_line += f" ({row.last_rdp_geo})"
+                        if duration:
+                            ip_line += f" | `{duration}`"
+                        lines.append(ip_line)
+                    else:
+                        ip_line = "Connected: `(unknown)`"
+                        if duration:
+                            ip_line += f" | `{duration}`"
+                        lines.append(ip_line)
             else:
                 lines.append(f"State: `{state_display}`")
                 if row.pending_disconnect_since:
